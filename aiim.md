@@ -1,0 +1,1 @@
+What it does: we give it a repo URL, and it clones it, reads the README, runs the setup steps in a clean Docker container, and outputs which step failed and why.
