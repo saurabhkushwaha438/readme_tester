@@ -1,5 +1,5 @@
 import { buildGraph, RECURSION_LIMIT } from "./graph.js";
-import { initialValues, type Mode, type RunInput } from "./state.js";
+import type { Mode, RunInput } from "./state.js";
 
 /**
  * Phase 1 entry point. Phase 8 replaces this with a real CLI:
@@ -25,10 +25,7 @@ async function main() {
 
   const graph = buildGraph();
   // recursionLimit is a per-invoke safety net for the run_step loop.
-  const final = await graph.invoke(
-    { ...input, ...initialValues },
-    { recursionLimit: RECURSION_LIMIT },
-  );
+  const final = await graph.invoke(input, { recursionLimit: RECURSION_LIMIT });
 
   console.log(`\n${final.reportMarkdown}`);
   console.log(
