@@ -1,14 +1,26 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { END, START, StateGraph } from "@langchain/langgraph";
-import { RunState, type RunStateType, type RunStateUpdate, type Step, type StepResult } from "./state.js";
-import { STUB_STEPS, stubExec, stubFix } from "./stub-exec.js";
+import {
+  isAlive,
+  listFiles,
+  pingDocker,
+  readFile,
+  startContainer,
+  type FileEntry,
+} from "./docker.js";
+import { discoverDocs } from "./docs.js";
+import { extractSteps, MAX_STEPS } from "./extract.js";
+import { CLONE_DIR_NAME, cloneRepo } from "./repo.js";
+import { RunState, type RunStateType, type RunStateUpdate, type StepResult } from "./state.js";
+import { stubExec, stubFix } from "./stub-exec.js";
 
 /**
- * Phase 1: the full graph topology with stub node bodies.
+ * The graph topology, with real nodes through Phase 4.
  *
- * Every node here is a placeholder for a later phase (noted per node). What is
- * real is the wiring: START -> setup -> discover_docs -> extract_steps ->
- * (run_step <-> diagnose) -> ci_crosscheck -> report -> END, including the
- * conditional edges and the two counters later phases rely on.
+ * Real: setup, discover_docs (Phase 3), extract_steps (Phase 4). Still stubs:
+ * run_step/diagnose execution (Phases 5–6), ci_crosscheck (7), report (8).
+ * The wiring and the routing are real either way.
  */
 
 /**
@@ -26,29 +38,107 @@ const log = (node: string, msg: string) => console.log(`[${node}] ${msg}`);
 // Nodes
 // ---------------------------------------------------------------------------
 
-/** Phase 3 stub: clone the repo and start the container. */
+/**
+ * Clone on the host and start the container that will run the commands.
+ *
+ * Docker is checked first so a missing daemon fails in a second instead of
+ * after a clone. A checkpointed run (Phase 9) resumes with its container if it
+ * is still alive, and reuses its checkout instead of cloning again.
+ */
 async function setup(state: RunStateType): Promise<RunStateUpdate> {
-  log("setup", `would clone ${state.repoUrl} and start a container (phase 3)`);
-  return {};
+  await pingDocker();
+
+  if (state.containerId) {
+    if (await isAlive(state.containerId)) {
+      log("setup", `reusing live container ${state.containerId.slice(0, 12)}`);
+      return {};
+    }
+    log("setup", `container ${state.containerId.slice(0, 12)} is gone; starting a new one`);
+  }
+
+  const cached = state.workdir ? join(state.workdir, CLONE_DIR_NAME) : undefined;
+  let workdir: string;
+  let cloneDir: string;
+
+  if (cached && existsSync(join(cached, ".git"))) {
+    workdir = state.workdir!;
+    cloneDir = cached;
+    log("setup", `reusing existing clone at ${cloneDir}`);
+  } else {
+    const clone = await cloneRepo(state.repoUrl);
+    workdir = clone.workdir;
+    cloneDir = clone.cloneDir;
+  }
+
+  const containerId = await startContainer({ hostWorkdir: cloneDir });
+  log("setup", `container ${containerId.slice(0, 12)} mounting ${cloneDir}`);
+  return { workdir, containerId };
 }
 
-/** Phase 3 stub: find README / CONTRIBUTING / INSTALL / docs/*setup*. */
+/** Every node that touches the filesystem needs setup to have succeeded. */
+function requireContainer(state: RunStateType): string {
+  if (!state.containerId) {
+    throw new Error("setup did not produce a container — check the Docker daemon and the clone URL");
+  }
+  return state.containerId;
+}
+
+/**
+ * The checkout listing that doc discovery needs, kept small on purpose.
+ *
+ * Root files plus two levels inside a docs folder. A recursive `find` over a
+ * monorepo would blow through the read cap on `node_modules` alone.
+ */
+async function listRepoEntries(containerId: string): Promise<FileEntry[]> {
+  const root = await listFiles(containerId, ".", { maxDepth: 1 });
+  const docDirs = root
+    .filter((entry) => entry.type === "dir" && /^(docs?|documentation)$/i.test(entry.path))
+    .map((entry) => entry.path);
+
+  const nested: FileEntry[] = [];
+  for (const dir of docDirs) {
+    const entries = await listFiles(containerId, dir, { maxDepth: 2 });
+    for (const entry of entries) {
+      nested.push({ path: `${dir}/${entry.path}`, type: entry.type });
+    }
+  }
+
+  return [...root, ...nested];
+}
+
+/** Phase 3: README / INSTALL / CONTRIBUTING / docs/*setup*, plus linked docs. */
 async function discover_docs(state: RunStateType): Promise<RunStateUpdate> {
-  log("discover_docs", `would scan the clone for docs (phase 3), mode=${state.mode}`);
-  return {
-    docs: [{ path: "README.md", title: "Stub README", content: "[stub doc]" }],
-  };
+  const containerId = requireContainer(state);
+  const entries = await listRepoEntries(containerId);
+  const docs = await discoverDocs({
+    entries,
+    read: (path) => readFile(containerId, path),
+  });
+
+  log(
+    "discover_docs",
+    docs.length > 0
+      ? `${docs.length} doc(s): ${docs.map((doc) => doc.path).join(", ")}`
+      : `no docs found among ${entries.length} entr(ies); nothing to extract`,
+  );
+  return { docs };
 }
 
-/** Phase 4 stub: label fenced code blocks into ordered steps. */
+/** Phase 4: deterministic block extraction, strong-model labelling. */
 async function extract_steps(state: RunStateType): Promise<RunStateUpdate> {
-  const steps: Step[] = STUB_STEPS.map((s) => ({
-    ...s,
-    runnable: true,
-    source: "README.md",
-  }));
-  log("extract_steps", `would label ${state.docs.length} doc(s) (phase 4); using ${steps.length} stub steps`);
-  return { steps, idx: 0 };
+  const result = await extractSteps(state.docs, { mode: state.mode, maxSteps: MAX_STEPS });
+  const runnable = result.steps.filter((step) => step.runnable).length;
+
+  log(
+    "extract_steps",
+    result.steps.length > 0
+      ? `${result.steps.length} step(s) from ${result.blocksFound} block(s): ` +
+          `${runnable} runnable, ${result.steps.length - runnable} not (skipped), ` +
+          `${result.usedFallback ? "doc order (LLM fell back)" : "LLM ordered"}`
+      : `no shell blocks in ${state.docs.length} doc(s); nothing to run`,
+  );
+
+  return { steps: result.steps, idx: 0, llmRetries: state.llmRetries + result.llmRetries };
 }
 
 /** Phase 5 stub: run steps[idx] and record the outcome. */
@@ -57,6 +147,23 @@ async function run_step(state: RunStateType): Promise<RunStateUpdate> {
   if (!step) {
     log("run_step", `no step at idx=${state.idx}, nothing to run`);
     return {};
+  }
+
+  // Phase 4 marks interactive/long-running blocks as not runnable: record them
+  // and move on. No exec, so no command budget is spent.
+  if (!step.runnable) {
+    const skipped: StepResult = {
+      stepId: step.id,
+      command: step.command,
+      status: "skip",
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      durationMs: 0,
+      reason: "not runnable unattended (interactive or long-running)",
+    };
+    log("run_step", `${step.id} -> skip (not runnable)`);
+    return { results: [skipped], idx: state.idx + 1 };
   }
 
   log("run_step", `running ${step.id} ${step.command} (idx=${state.idx})`);

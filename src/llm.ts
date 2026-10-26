@@ -1,3 +1,4 @@
+import "./env.js";
 import { ChatGroq } from "@langchain/groq";
 
 /**
@@ -13,18 +14,39 @@ import { ChatGroq } from "@langchain/groq";
 export const FAST_MODEL = process.env.GROQ_FAST_MODEL ?? "openai/gpt-oss-20b";
 export const STRONG_MODEL = process.env.GROQ_STRONG_MODEL ?? "openai/gpt-oss-120b";
 
-const build = (model: string) =>
-  new ChatGroq({
-    model,
-    temperature: 0,
-    maxRetries: 3,
-  });
+/**
+ * Models are built lazily.
+ *
+ * Constructing ChatGroq without GROQ_API_KEY throws, and phases 1–5 are
+ * supposed to run without an LLM in the path — eager construction would make
+ * `import "./graph.js"` fail on a machine with no key at all. Lazy getters mean
+ * the error arrives when a node actually needs a model, with a message that
+ * says what to do.
+ */
+function make(model: string): ChatGroq {
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error(
+      `GROQ_API_KEY is not set, but ${model} is needed for this run. ` +
+        'Add GROQ_API_KEY=... to .env (or export it) — see phases.md Phase 0.',
+    );
+  }
+  return new ChatGroq({ model, temperature: 0, maxRetries: 3 });
+}
 
-/** Small model: classification, CI mismatch summaries. */
-export const fast = build(FAST_MODEL);
+let fastModel: ChatGroq | undefined;
+let strongModel: ChatGroq | undefined;
 
-/** 70B+ class model: step extraction, failure diagnosis, patch wording. */
-export const strong = build(STRONG_MODEL);
+/** Small model: classification, CI mismatch summaries (Phase 7). */
+export function getFast(): ChatGroq {
+  fastModel ??= make(FAST_MODEL);
+  return fastModel;
+}
 
-export const models = { fast, strong } as const;
-export type ModelTier = keyof typeof models;
+/** 70B+ class model: step extraction (Phase 4), failure diagnosis (Phase 6). */
+export function getStrong(): ChatGroq {
+  strongModel ??= make(STRONG_MODEL);
+  return strongModel;
+}
+
+export const modelFor = { fast: getFast, strong: getStrong } as const;
+export type ModelTier = keyof typeof modelFor;

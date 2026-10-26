@@ -48,6 +48,15 @@ export function docker(): Docker {
   return client;
 }
 
+/**
+ * Containers this process started and has not removed yet.
+ *
+ * Phase 9 wants a `finally` destroy, but state is not available after a node
+ * throws. Tracking ids here lets the CLI clean up whatever a failed run left
+ * behind, instead of accumulating stopped containers across runs.
+ */
+const active = new Set<string>();
+
 /** Fail fast with an actionable message when no daemon is listening. */
 export async function pingDocker(): Promise<void> {
   try {
@@ -208,18 +217,46 @@ export async function startContainer(opts: StartContainerOptions): Promise<strin
     throw new Error(`could not start container from ${image}: ${message(err)}`);
   }
 
+  active.add(container.id);
   console.log(`[docker] started ${container.id.slice(0, 12)} from ${image}`);
   return container.id;
 }
 
+/** True while the container still exists and is running (used to resume a run). */
+export async function isAlive(containerId: string): Promise<boolean> {
+  try {
+    const info = await docker().getContainer(containerId).inspect();
+    return Boolean(info.State?.Running);
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw new Error(`could not inspect container ${containerId.slice(0, 12)}: ${message(err)}`);
+  }
+}
+
 /** Force-remove the container. Safe to call twice; 404 is treated as success. */
 export async function destroy(containerId: string): Promise<void> {
+  active.delete(containerId);
   try {
     await docker().getContainer(containerId).remove({ force: true, v: true });
     console.log(`[docker] destroyed ${containerId.slice(0, 12)}`);
   } catch (err) {
     if (isNotFound(err)) return;
     throw new Error(`could not destroy container ${containerId.slice(0, 12)}: ${message(err)}`);
+  }
+}
+
+/**
+ * Cleanup hook for the CLI's `finally`: remove every container this process
+ * started and has not already removed. Failures are logged, never thrown — a
+ * cleanup problem must not mask the real error the run is unwinding from.
+ */
+export async function destroyAll(): Promise<void> {
+  for (const id of [...active]) {
+    try {
+      await destroy(id);
+    } catch (err) {
+      console.warn(`[docker] cleanup failed for ${id.slice(0, 12)}: ${message(err)}`);
+    }
   }
 }
 
