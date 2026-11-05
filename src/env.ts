@@ -10,6 +10,7 @@
  * `env -u GROQ_API_KEY npm start` still means "no key".
  */
 import { existsSync } from "node:fs";
+import { warnLine } from "./log.js";
 
 let loaded = false;
 
@@ -21,7 +22,7 @@ export function loadEnv(): void {
   try {
     process.loadEnvFile(".env");
   } catch (err) {
-    console.warn(`[env] ignoring unreadable .env: ${err instanceof Error ? err.message : err}`);
+    warnLine(`[env] ignoring unreadable .env: ${err instanceof Error ? err.message : err}`);
   }
 }
 

@@ -11,8 +11,16 @@
  */
 import { z } from "zod";
 import { extractCodeBlocks, heuristicLabels, type CodeBlock } from "./docs.js";
-import { getStrong } from "./llm.js";
-import { ModeSchema, type DocPage, type Mode, type Step } from "./state.js";
+import { callModel, getStrong, LlmBudgetExhausted } from "./llm.js";
+import { infoLine, warnLine } from "./log.js";
+import {
+  ModeSchema,
+  SELF_CLONE_SKIP_REASON,
+  type DocPage,
+  type DocumentedCommand,
+  type Mode,
+  type Step,
+} from "./state.js";
 
 /**
  * Upper bound on runnable steps per run.
@@ -36,7 +44,11 @@ export const BlockLabelSchema = z.object({
     .boolean()
     .describe("false for interactive prompts, long-running servers, or placeholder commands."),
   mode: ModeSchema.describe('"user" for install/use steps, "contributor" for repo-development steps.'),
-  reason: z.string().optional().describe("Short justification, used in the report."),
+  // Providers routinely send `null` for an absent optional field. Zod's
+  // `.optional()` accepts `undefined` only; without `.nullable()` the whole
+  // classification fails and the run falls back to document order (Mocha's
+  // first c3 extraction hit exactly this).
+  reason: z.string().nullable().optional().describe("Short justification, used in the report."),
 });
 
 export const ClassificationSchema = z.object({
@@ -92,9 +104,30 @@ Rules:
 1. Only reference the ids listed below. Never invent, rewrite, merge or split a
    command — a block you return is run exactly as written.
 2. Omit blocks a reader should not run at all: sample output, unrelated
-   examples, alternative install methods that duplicate another block.
+   examples, and usage examples that invoke the finished tool with example
+   arguments (they demonstrate the API, they do not set up the repository).
+   In particular, omit commands that install or invoke *this package* from
+   another project ('npm install my-package', 'npx my-package') — those are
+   usage examples for consumers, not instructions for setting up this repository.
+   When two blocks are alternative forms of the same setup command (for example
+   'npm install' and 'npm install --ignore-scripts'), keep ONE - preferably the
+   plain form - and do not drop both. A missing install block makes every later
+   test fail.
 3. runnable=false when a block cannot run unattended: it prompts for input,
-   needs credentials (logins, tokens), or starts a long-running server/watcher.
+   needs credentials (logins, tokens), starts a long-running server/watcher, or
+   assumes a service is already running (curl against localhost, opening a URL).
+   Commands that need Docker or a terminal multiplexer such as tmux are not
+   runnable in this sandbox either. A command with '--watch' (or one that says
+   it is waiting for changes) is a long-running watcher, not a one-shot test.
+   Interactive commands such as 'git commit' without '-m', 'npm init' without
+   '-y', an editor, or 'git push'/remote operations that need GitHub auth are
+   not runnable. So are OS-specific instructions for a different platform
+   (macOS '/Applications', 'xattr', 'brew'; Windows paths) when the container is
+   Linux, and quoted examples whose line starts with '>'. Also mark a block
+   runnable=false when it depends on an earlier block that cannot run (for
+   example 'npm install' after a skipped interactive 'npm init').
+   A block that mixes one such command with a setup command is still not
+   runnable as written; do not mark it runnable just because the first line is.
 4. mode="user" for steps that install and use the tool. mode="contributor" for
    steps only someone developing in this repository needs: running tests,
    linting, building from source, releasing.
@@ -115,7 +148,10 @@ function llmClassifier(): Classifier {
   });
 
   return async (blocks, attempt) => {
-    const result = await structured.invoke(buildPrompt(blocks, attempt));
+    // Phase 9: budget + backoff live in one place; validation retries stay here.
+    const result = await callModel("extract_steps", () =>
+      structured.invoke(buildPrompt(blocks, attempt)),
+    );
     // Defensive: a provider that returns an object instead of parsing it.
     return ClassificationSchema.parse(result);
   };
@@ -151,6 +187,10 @@ export function chunkBlocks(blocks: CodeBlock[]): CodeBlock[][] {
 
 export interface ExtractOptions {
   mode: Mode;
+  /** `name` from the repo's package.json, used to spot consumer-only installs. */
+  ownPackage?: string;
+  /** The clone URL from the CLI, used to spot steps that clone this repo again. */
+  repoUrl?: string;
   /** Test seam; defaults to the Groq classifier. */
   classify?: Classifier;
   maxSteps?: number;
@@ -158,6 +198,15 @@ export interface ExtractOptions {
 
 export interface ExtractResult {
   steps: Step[];
+  /**
+   * Every shell block in the docs, before labelling and mode filtering — used by
+   * the Phase 7 diff.
+   *
+   * Deliberately not the labelled subset: whether a command is *in the docs* is a
+   * deterministic fact, and a model that labels only half the blocks must not turn
+   * the other half into "undocumented in CI" findings.
+   */
+  documented: DocumentedCommand[];
   /** Retries actually spent — added to the run's `llmRetries`. */
   llmRetries: number;
   /** True when the model could not deliver and doc order was used instead. */
@@ -174,6 +223,120 @@ interface Labelled {
 /** Contributor runs are a superset: contributors install first, then test. */
 const modeAllows = (wanted: Mode, label: Mode): boolean => wanted === "contributor" || label === "user";
 
+/** Commands kept for the CI diff; enough to describe a repo, bounded for state. */
+const MAX_DOCUMENTED = 60;
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Is this command telling a *consumer* of the package how to install it?
+ *
+ * `npm install p-limit` at the top of p-limit's own readme is not repository
+ * setup — running it inside the checkout installs the package into its own
+ * project, and on a slow network that looks exactly like a broken install.
+ * Found by the Phase 10 runs, where it was the only "step" in the readme.
+ */
+export function isConsumerInstall(command: string, packageName: string | undefined): boolean {
+  if (!packageName) return false;
+  const name = escapeRegExp(packageName);
+
+  // End-anchored on purpose: `npm install p-limit && npm test` does repo work
+  // after the consumer part, so it is not a pure usage example.
+  const patterns = [
+    new RegExp(
+      `^(?:npm\\s+(?:i|install)|yarn\\s+(?:add|install)|pnpm\\s+(?:add|install)|bun\\s+(?:add|install))\\s+(?:-\\S+\\s+)*${name}(?:@\\S+)?\\s*$`,
+      "i",
+    ),
+    new RegExp(`^npx\\s+(?:-\\S+\\s+)*${name}(?:@\\S+)?\\s*$`, "i"),
+  ];
+
+  const lines = command
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+
+  // Every line has to be a consumer install: a block that also does repo work is
+  // left alone rather than half-dropped.
+  return lines.length > 0 && lines.every((line) => patterns.some((pattern) => pattern.test(line)));
+}
+
+/**
+ * `https://github.com/Owner/Repo.git` -> `github.com/owner/repo`.
+ *
+ * Handles the URL, scp-style (`git@host:owner/repo`) and `owner/repo` forms so
+ * a readme's clone line can be compared with the URL the run was given.
+ */
+export function repoKey(url: string): string {
+  const text = url.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
+  const scp = /^[\w.-]+@([^:/]+):(.+)$/.exec(text);
+  return (scp ? `${scp[1]}/${scp[2]}` : text)
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/^[^/]+@/, "")
+    .replace(/^www\./i, "")
+    .toLowerCase();
+}
+
+const repoTail = (key: string): string => key.split("/").filter(Boolean).slice(-2).join("/");
+
+/**
+ * Is this block the docs telling a reader to clone the repository under test?
+ *
+ * The run already has that checkout, so executing the line again clones a second
+ * copy from inside the container — which on a big repo means a two-minute
+ * timeout and a failure that says nothing about the docs. Phase 10 found it in a
+ * real readme, where it was the first and most expensive false failure.
+ *
+ * Only a block that is *nothing but* clone-and-cd qualifies: `git clone` of some
+ * other repository is a genuine setup step.
+ */
+export function isSelfClone(command: string, repoUrl: string | undefined): boolean {
+  if (!repoUrl) return false;
+
+  const steps = command
+    .split(/\n|&&|;/)
+    .map((part) => part.trim())
+    .filter((part) => part !== "" && !part.startsWith("#"));
+  if (steps.length === 0) return false;
+
+  const wanted = repoKey(repoUrl);
+  let cloned = false;
+
+  for (const step of steps) {
+    const clone = /^git\s+clone\b(.*)$/.exec(step);
+    if (clone) {
+      // The URL is whichever argument looks like one: `--depth 1` puts a bare
+      // `1` where a first-non-flag-token regex would expect the repository.
+      const arg = clone[1]!
+        .trim()
+        .split(/\s+/)
+        .find(
+          (token) =>
+            !token.startsWith("-") && /:\/\/|^[^/]+@[^:]+:|^[\w.-]+\/[\w.-]+$/.test(token),
+        );
+      if (!arg) return false;
+
+      const key = repoKey(arg);
+      if (key !== wanted && repoTail(key) !== repoTail(wanted)) return false;
+      cloned = true;
+      continue;
+    }
+    // `cd paradev` after the clone is part of the same acquisition step.
+    if (/^cd\s+\S+/.test(step)) continue;
+    return false;
+  }
+
+  return cloned;
+}
+
+/** All blocks -> documented commands, in doc order, with no mode filter. */
+function toDocumented(blocks: CodeBlock[]): DocumentedCommand[] {
+  return blocks.slice(0, MAX_DOCUMENTED).map((block) => ({
+    command: block.command,
+    source: block.source,
+    ...(block.heading ? { heading: block.heading } : {}),
+  }));
+}
+
 /**
  * Labels -> ordered steps, applying the mode filter and the step caps.
  *
@@ -181,18 +344,23 @@ const modeAllows = (wanted: Mode, label: Mode): boolean => wanted === "contribut
  * "the docs contain a command nobody can run unattended". They cost no
  * commands: `run_step` must mark them `skip` without exec (Phase 5).
  */
-function toSteps(labelled: Labelled[], mode: Mode, maxSteps: number): Step[] {
+function toSteps(
+  labelled: Labelled[],
+  mode: Mode,
+  maxSteps: number,
+  repoUrl?: string,
+): Step[] {
   let candidates = labelled.filter((item) => modeAllows(mode, item.mode));
 
   // A model that labels everything "contributor" would leave a user run empty;
   // an empty run tests nothing, which is worse than testing too much.
   if (candidates.length === 0 && labelled.length > 0) {
-    console.warn(
+    warnLine(
       `[extract_steps] mode=${mode} filtered out all ${labelled.length} block(s); keeping them all`,
     );
     candidates = labelled;
   } else if (candidates.length < labelled.length) {
-    console.log(
+    infoLine(
       `[extract_steps] mode=${mode} kept ${candidates.length}/${labelled.length} block(s)`,
     );
   }
@@ -202,7 +370,12 @@ function toSteps(labelled: Labelled[], mode: Mode, maxSteps: number): Step[] {
   let skipped = 0;
 
   for (const item of candidates) {
-    if (item.runnable) {
+    // A documented clone of the repo under test is recorded as a skip, whatever
+    // the model said: the checkout exists, so running it tests the network.
+    const selfClone = isSelfClone(item.block.command, repoUrl);
+    const canRun = item.runnable && !selfClone;
+
+    if (canRun) {
       if (runnable >= maxSteps) continue;
       runnable++;
     } else {
@@ -213,9 +386,10 @@ function toSteps(labelled: Labelled[], mode: Mode, maxSteps: number): Step[] {
       id: `s${steps.length + 1}`,
       command: item.block.command,
       mode: item.mode,
-      runnable: item.runnable,
+      runnable: canRun,
       source: item.block.source,
       ...(item.block.heading ? { heading: item.block.heading } : {}),
+      ...(selfClone ? { skipReason: SELF_CLONE_SKIP_REASON } : {}),
     });
   }
 
@@ -229,9 +403,19 @@ function toSteps(labelled: Labelled[], mode: Mode, maxSteps: number): Step[] {
  * degrades to the deterministic path and reports that it did.
  */
 export async function extractSteps(docs: DocPage[], opts: ExtractOptions): Promise<ExtractResult> {
-  const blocks = docs.flatMap((doc, index) => extractCodeBlocks(doc.content, doc.path, index));
+  const all = docs.flatMap((doc, index) => extractCodeBlocks(doc.content, doc.path, index));
+
+  // Phase 10: consumer usage examples are not setup steps. They would also pollute
+  // the CI diff, because `docCommands` is built from these same blocks.
+  const blocks = all.filter((block) => !isConsumerInstall(block.command, opts.ownPackage));
+  if (blocks.length < all.length) {
+    infoLine(
+      `[extract_steps] dropped ${all.length - blocks.length} consumer install example(s)`,
+    );
+  }
+
   if (blocks.length === 0) {
-    return { steps: [], llmRetries: 0, usedFallback: false, blocksFound: 0 };
+    return { steps: [], documented: [], llmRetries: 0, usedFallback: false, blocksFound: 0 };
   }
 
   const maxSteps = opts.maxSteps ?? MAX_STEPS;
@@ -251,13 +435,20 @@ export async function extractSteps(docs: DocPage[], opts: ExtractOptions): Promi
         answer = await classify(chunk, attempt);
         break;
       } catch (err) {
+        // Out of budget is not a failed attempt: retrying cannot succeed, and
+        // counting it as a retry would misreport what happened in the report.
+        if (err instanceof LlmBudgetExhausted) {
+          warnLine("[extract_steps] LLM budget exhausted; using doc order");
+          usedFallback = true;
+          break;
+        }
         if (attempt === 2) {
-          console.warn(`[extract_steps] LLM extraction failed twice (${reason(err)}); using doc order`);
+          warnLine(`[extract_steps] LLM extraction failed twice (${reason(err)}); using doc order`);
           usedFallback = true;
           break;
         }
         llmRetries++;
-        console.warn(`[extract_steps] LLM extraction failed (${reason(err)}); retrying once`);
+        warnLine(`[extract_steps] LLM extraction failed (${reason(err)}); retrying once`);
       }
     }
 
@@ -284,7 +475,7 @@ export async function extractSteps(docs: DocPage[], opts: ExtractOptions): Promi
 
     const missing = chunk.length - answer.steps.length + unknown;
     if (unknown > 0 || duplicates > 0 || missing > 0) {
-      console.warn(
+      warnLine(
         `[extract_steps] model answer: ${answer.steps.length} label(s), ` +
           `${unknown} unknown id(s), ${duplicates} duplicate(s), ~${Math.max(0, missing)} block(s) not labelled`,
       );
@@ -297,7 +488,8 @@ export async function extractSteps(docs: DocPage[], opts: ExtractOptions): Promi
       ...heuristicLabels(block.command, block.source, block.heading),
     }));
     return {
-      steps: toSteps(fallback, opts.mode, maxSteps),
+      steps: toSteps(fallback, opts.mode, maxSteps, opts.repoUrl),
+      documented: toDocumented(blocks),
       llmRetries,
       usedFallback: true,
       blocksFound: blocks.length,
@@ -305,7 +497,8 @@ export async function extractSteps(docs: DocPage[], opts: ExtractOptions): Promi
   }
 
   return {
-    steps: toSteps(labelled, opts.mode, maxSteps),
+    steps: toSteps(labelled, opts.mode, maxSteps, opts.repoUrl),
+    documented: toDocumented(blocks),
     llmRetries,
     usedFallback: false,
     blocksFound: blocks.length,

@@ -8,6 +8,7 @@
  */
 import { posix } from "node:path";
 import type { FileEntry } from "./docker.js";
+import { warnLine } from "./log.js";
 import type { DocPage, Mode } from "./state.js";
 
 /** How much of one doc we keep in state (checkpoints carry all of it). */
@@ -87,7 +88,15 @@ function cleanShellBody(lines: string[], language: string): string | undefined {
   const prompted = lines.filter((line) => /^\s*\$\s+\S/.test(line));
   const source = CONSOLE_LANGS.has(language) && prompted.length > 0 ? prompted : lines;
 
-  const out = source.map((line) => line.replace(/^\s*\$\s+/, "").trimEnd());
+  const out = source.map((line) =>
+    line
+      .replace(/^\s*\$\s+/, "")
+      // `>` is also a redirect, but a line that starts `> ` and then a command
+      // is a prompt marker copied from a shell session (Fastify's Testing guide
+      // does this inside a bash fence). Strip the prompt, keep the command.
+      .replace(/^\s*>\s+(?=\S)/, "")
+      .trimEnd(),
+  );
 
   while (out.length > 0 && out[0]!.trim() === "") out.shift();
   while (out.length > 0 && out[out.length - 1]!.trim() === "") out.pop();
@@ -111,6 +120,11 @@ export function extractCodeBlocks(
   source: string,
   docIndex = 0,
 ): CodeBlock[] {
+  // Flask and Requests keep their contributor guide in RST. Without this
+  // dispatch the whole file is invisible and a real run reports "no shell
+  // blocks" (Phase 10, `batch-a/flask`). Markdown stays the default.
+  if (/\.rst$/i.test(source)) return extractRstCodeBlocks(markdown, source, docIndex);
+
   const lines = markdown.split(/\r?\n/);
   const blocks: CodeBlock[] = [];
   let heading: string | undefined;
@@ -144,6 +158,80 @@ export function extractCodeBlocks(
       language,
       command,
     });
+  }
+
+  return blocks;
+}
+
+/**
+ * Shell blocks from reStructuredText.
+ *
+ * Handles the common `.. code-block:: bash` / `.. code:: console` directive with
+ * an indented body, which is what Flask and Requests use. Literal blocks (`::`)
+ * and options such as `:linenos:` are not interpreted; a directive with a
+ * non-shell language is skipped rather than guessed.
+ */
+function extractRstCodeBlocks(text: string, source: string, docIndex = 0): CodeBlock[] {
+  const lines = text.split(/\r?\n/);
+  const blocks: CodeBlock[] = [];
+  let heading: string | undefined;
+  let index = 0;
+
+  const indentOf = (line: string): number => line.length - line.trimStart().length;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const directive = /^\s*\.\.\s+(?:code-block|code|sourcecode)::\s*([^\s]+)/i.exec(line);
+    if (!directive) {
+      // RST section title: the next line is an underline of punctuation.
+      if (
+        line.trim() !== "" &&
+        i + 1 < lines.length &&
+        /^\s*[=\-~^"'`#*+]{3,}\s*$/.test(lines[i + 1]!)
+      ) {
+        heading = line.trim();
+      }
+      continue;
+    }
+
+    const language = directive[1]!.toLowerCase();
+    let j = i + 1;
+    while (j < lines.length && lines[j]!.trim() === "") j++;
+
+    if (!SHELL_LANGS.has(language)) {
+      // Skip the directive body so its lines cannot be mistaken for the next
+      // section's heading.
+      while (j < lines.length && (lines[j]!.trim() === "" || indentOf(lines[j]!) > 0)) j++;
+      i = j - 1;
+      continue;
+    }
+
+    const body: string[] = [];
+    let baseIndent: number | undefined;
+    for (; j < lines.length; j++) {
+      const bodyLine = lines[j]!;
+      if (bodyLine.trim() === "") {
+        body.push("");
+        continue;
+      }
+      const indent = indentOf(bodyLine);
+      if (indent === 0) break;
+      baseIndent ??= indent;
+      if (indent < baseIndent) break;
+      body.push(bodyLine.slice(baseIndent));
+    }
+
+    const command = cleanShellBody(body, language);
+    if (command !== undefined) {
+      blocks.push({
+        blockId: `${docIndex}-${index++}`,
+        source,
+        ...(heading ? { heading } : {}),
+        language,
+        command,
+      });
+    }
+    i = j - 1;
   }
 
   return blocks;
@@ -201,12 +289,16 @@ const DOC_RANK: ReadonlyArray<readonly [RegExp, number]> = [
   [/^readme(\.[a-z]+)?$/i, 0],
   [/^install(ation|ing)?(\.[a-z]+)?$/i, 1],
   [
-    /^docs\/(?:[^/]+\/)?(?:setup|install|installation|getting[-_]?started|quick[-_]?start|prerequisites|requirements)[^/]*\.(?:md|markdown)$/i,
+    /^docs\/(?:[^/]+\/)?(?:setup|install|installation|getting[-_]?started|quick[-_]?start|prerequisites|requirements)[^/]*\.(?:md|markdown|rst)$/i,
     2,
   ],
   [/^contributing(\.[a-z]+)?$/i, 3],
+  // GitHub's own convention: a contributing guide in `.github/` is found by the
+  // forge, not by anyone reading the root listing. Express, body-parser and many
+  // others keep theirs there, and Phase 10 showed the cost of missing it.
+  [/^\.github\/contributing(\.[a-z]+)?$/i, 3],
   [
-    /^docs\/(?:[^/]+\/)?(?:develop\w*|contribut\w*|hacking|testing|tests|build)[^/]*\.(?:md|markdown)$/i,
+    /^docs\/(?:[^/]+\/)?(?:develop\w*|contribut\w*|hacking|testing|tests|build)[^/]*\.(?:md|markdown|rst)$/i,
     4,
   ],
 ];
@@ -262,7 +354,7 @@ export function resolveLink(fromPath: string, target: string): string | undefine
     : posix.normalize(posix.join(posix.dirname(normalizePath(fromPath)), clean));
 
   if (!joined || joined.startsWith("..") || posix.isAbsolute(joined)) return undefined;
-  if (!/\.(md|markdown)$/i.test(joined)) return undefined;
+  if (!/\.(md|markdown|rst)$/i.test(joined)) return undefined;
   return normalizePath(joined);
 }
 
@@ -307,7 +399,7 @@ export async function discoverDocs(opts: DiscoverOptions): Promise<DocPage[]> {
     try {
       content = await opts.read(path);
     } catch (err) {
-      console.warn(`[docs] skipping ${path}: ${err instanceof Error ? err.message : err}`);
+      warnLine(`[docs] skipping ${path}: ${err instanceof Error ? err.message : err}`);
       continue;
     }
 

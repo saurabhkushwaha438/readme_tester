@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { Writable } from "node:stream";
 import type { Duplex } from "node:stream";
 import Docker from "dockerode";
+import { infoLine, warnLine } from "./log.js";
 
 /**
  * Phase 2: the Docker layer.
@@ -167,7 +168,7 @@ async function ensureImage(image: string): Promise<void> {
     if (!isNotFound(err)) throw new Error(`could not inspect image ${image}: ${message(err)}`);
   }
 
-  console.log(`[docker] pulling ${image} (first run only)…`);
+  infoLine(`[docker] pulling ${image} (first run only)…`);
   const stream = await d.pull(image);
   await new Promise<void>((resolvePromise, reject) => {
     d.modem.followProgress(stream, (err) => (err ? reject(err) : resolvePromise()));
@@ -218,7 +219,7 @@ export async function startContainer(opts: StartContainerOptions): Promise<strin
   }
 
   active.add(container.id);
-  console.log(`[docker] started ${container.id.slice(0, 12)} from ${image}`);
+  infoLine(`[docker] started ${container.id.slice(0, 12)} from ${image}`);
   return container.id;
 }
 
@@ -238,7 +239,7 @@ export async function destroy(containerId: string): Promise<void> {
   active.delete(containerId);
   try {
     await docker().getContainer(containerId).remove({ force: true, v: true });
-    console.log(`[docker] destroyed ${containerId.slice(0, 12)}`);
+    infoLine(`[docker] destroyed ${containerId.slice(0, 12)}`);
   } catch (err) {
     if (isNotFound(err)) return;
     throw new Error(`could not destroy container ${containerId.slice(0, 12)}: ${message(err)}`);
@@ -255,7 +256,7 @@ export async function destroyAll(): Promise<void> {
     try {
       await destroy(id);
     } catch (err) {
-      console.warn(`[docker] cleanup failed for ${id.slice(0, 12)}: ${message(err)}`);
+      warnLine(`[docker] cleanup failed for ${id.slice(0, 12)}: ${message(err)}`);
     }
   }
 }
@@ -308,7 +309,12 @@ async function run(containerId: string, command: string, opts: RunOptions): Prom
   let execInstance;
   try {
     execInstance = await container.exec({
-      Cmd: ["timeout", "--kill-after=5s", `${seconds}s`, "bash", "-lc", command],
+      // Phase 10: not `-l`. Debian's /etc/profile resets PATH for root, which
+      // drops /usr/local/go/bin and /root/.cargo/bin; `go` and `cargo` then look
+      // missing even though the image installed them (fzf's `make test` failed
+      // exactly this way). A non-login shell inherits the image's ENV PATH,
+      // which is what `docker run` gives a user.
+      Cmd: ["timeout", "--kill-after=5s", `${seconds}s`, "bash", "-c", command],
       AttachStdout: true,
       AttachStderr: true,
       WorkingDir: opts.workdir,
@@ -357,7 +363,7 @@ async function run(containerId: string, command: string, opts: RunOptions): Prom
     exitCode = (await execInstance.inspect()).ExitCode ?? null;
   } catch (err) {
     // A destroyed stream can cost us the inspect call; the output still stands.
-    console.log(`[docker] could not read exit code for \`${command}\`: ${message(err)}`);
+    infoLine(`[docker] could not read exit code for \`${command}\`: ${message(err)}`);
   }
 
   // 124 is `timeout`'s own exit code; 137 is the SIGKILL from --kill-after.

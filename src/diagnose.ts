@@ -13,7 +13,8 @@
 import { z } from "zod";
 import { exec, type ExecResult } from "./docker.js";
 import { heuristicLabels } from "./docs.js";
-import { getStrong } from "./llm.js";
+import { callModel, getStrong, LlmBudgetExhausted } from "./llm.js";
+import { warnLine } from "./log.js";
 import type { Step, StepResult, StepStatus } from "./state.js";
 
 /** A proposed fix must be a command, not an essay. */
@@ -37,6 +38,7 @@ export const FixSchema = z.object({
     ),
   reason: z
     .string()
+    .nullable()
     .describe("One or two sentences: why the documented command failed, and what the fix changes."),
 });
 export type Fix = z.infer<typeof FixSchema>;
@@ -68,6 +70,8 @@ export interface DiagnoseInput {
   failure: StepResult;
   image?: string;
   timeoutMs?: number;
+  /** Directory the command was run in, carried from the preceding `cd`. */
+  workdir?: string;
   propose?: Proposer;
 }
 
@@ -96,6 +100,9 @@ Rules:
 3. Prefer the smallest honest fix: a missing system package, the repository's real install command (npm ci, pnpm install --frozen-lockfile), a flag the docs omit.
 4. Do not return the failing command unchanged.
 5. If the failure cannot be fixed from inside the container, return command=null and explain why.
+6. Explain the failure using only the command and the output above. Do not name a service,
+   database, environment variable or file that the output does not mention — the report
+   quotes the output next to your explanation, so an invented cause is visible.
 
 Failed step:
   command: ${step.command.replace(/\n/g, "\n           ")}
@@ -116,7 +123,8 @@ ${stderr}`;
 /** The production proposer: one structured call to the strong model. */
 function llmProposer(): Proposer {
   const structured = getStrong().withStructuredOutput(FixSchema, { name: "propose_setup_fix" });
-  return async (input) => FixSchema.parse(await structured.invoke(buildFixPrompt(input)));
+  return async (input) =>
+    FixSchema.parse(await callModel("diagnose", () => structured.invoke(buildFixPrompt(input))));
 }
 
 // ---------------------------------------------------------------------------
@@ -229,11 +237,18 @@ export interface Diagnosis {
   llmRetries: number;
 }
 
-/** A failure that never reached the container. */
+/**
+ * A failure that never reached the container.
+ *
+ * `command` is always the documented command, never the proposal: a rejected or
+ * unparseable fix did not run, and a report that shows it as "the command" pairs
+ * the fix's text with the documented command's error output. The proposal goes
+ * in `attemptedFix` and the reason, which is where the report reads it from.
+ */
 function declined(input: DiagnoseInput, reason: string, command?: string): Diagnosis {
   return {
     status: "fail",
-    command: command ?? input.step.command,
+    command: input.step.command,
     exitCode: input.failure.exitCode,
     stdout: "",
     stderr: "",
@@ -266,9 +281,12 @@ export async function diagnoseStep(input: DiagnoseInput): Promise<Diagnosis> {
       break;
     } catch (err) {
       lastError = message(err);
+      // No budget means no retry: the next call is refused before it reaches
+      // the provider, and calling it a retry would inflate the report's count.
+      if (err instanceof LlmBudgetExhausted) break;
       if (attempt === 1) {
         llmRetries++;
-        console.warn(`[diagnose] proposal failed (${lastError}); retrying once`);
+        warnLine(`[diagnose] proposal failed (${lastError}); retrying once`);
       }
     }
   }
@@ -282,7 +300,7 @@ export async function diagnoseStep(input: DiagnoseInput): Promise<Diagnosis> {
 
   if (fix.command === null || fix.command.trim() === "") {
     return {
-      ...declined(input, `model proposed no fix: ${brief(fix.reason)}`),
+      ...declined(input, `model proposed no fix: ${brief(fix.reason ?? "")}`),
       llmRetries,
     };
   }
@@ -305,7 +323,10 @@ export async function diagnoseStep(input: DiagnoseInput): Promise<Diagnosis> {
 
   let out: ExecResult;
   try {
-    out = await exec(input.containerId, proposal, { timeoutMs: input.timeoutMs });
+    out = await exec(input.containerId, proposal, {
+      timeoutMs: input.timeoutMs,
+      workdir: input.workdir,
+    });
   } catch (err) {
     return {
       ...declined(input, `could not run the fix: ${message(err)}`, proposal),
@@ -314,19 +335,23 @@ export async function diagnoseStep(input: DiagnoseInput): Promise<Diagnosis> {
   }
 
   const worked = out.exitCode === 0 && !out.timedOut;
-  const note = brief(fix.reason);
+  const note = brief(fix.reason ?? "");
 
   if (!worked) {
+    // The row belongs to the documented command, and so does the evidence: the
+    // attempted fix is reported in the reason, not as the thing the docs say to
+    // run. Phase 10 showed the alternative reading like a doc change that never
+    // happened.
     return {
       status: "fail",
-      command: proposal,
-      exitCode: out.exitCode,
-      stdout: out.stdout,
-      stderr: out.stderr,
-      durationMs: out.durationMs,
+      command: input.step.command,
+      exitCode: input.failure.exitCode,
+      stdout: input.failure.stdout,
+      stderr: input.failure.stderr,
+      durationMs: input.failure.durationMs + out.durationMs,
       reason: out.timedOut
-        ? `${note} — the fix timed out after ${Math.round(out.durationMs / 1000)}s`
-        : `${note} — the fix failed too (exit ${out.exitCode ?? "?"})`,
+        ? `${note} — the proposed fix timed out after ${Math.round(out.durationMs / 1000)}s`
+        : `${note} — the proposed fix failed too (exit ${out.exitCode ?? "?"})`,
       attemptedFix: proposal,
       commandsRun: 1,
       llmRetries,
@@ -338,7 +363,10 @@ export async function diagnoseStep(input: DiagnoseInput): Promise<Diagnosis> {
   // the only honest test of "workaround", and it costs one extra command.
   let verified: ExecResult | undefined;
   try {
-    verified = await exec(input.containerId, input.step.command, { timeoutMs: input.timeoutMs });
+    verified = await exec(input.containerId, input.step.command, {
+      timeoutMs: input.timeoutMs,
+      workdir: input.workdir,
+    });
   } catch (err) {
     return {
       status: "fail",

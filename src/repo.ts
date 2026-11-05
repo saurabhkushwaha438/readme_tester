@@ -8,17 +8,30 @@
  * a crash — including when the graph throws instead of reaching `report`.
  */
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
+import { cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { infoLine, warnLine } from "./log.js";
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    const s = await stat(p);
+    return s.isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 const run = promisify(execFile);
 
 /** Directory name of the clone inside the temp workdir. */
 export const CLONE_DIR_NAME = "repo";
 
-/** A slow repo (monorepo, shallow clone) can still take a while. */
+/** A slow repo (monorepo, full history) can still take a while. */
 export const DEFAULT_CLONE_TIMEOUT_MS = Number(
   process.env.README_TEST_CLONE_TIMEOUT_MS ?? 180_000,
 );
@@ -45,10 +58,16 @@ function gitReason(err: unknown): string {
 }
 
 /**
- * Shallow-clone `repoUrl` into a fresh temp workdir.
+ * Clone `repoUrl` into a fresh temp workdir.
  *
- * `--depth 1 --single-branch` keeps a test run cheap; nothing here needs
- * history. Local paths work too, which is what the tests use.
+ * Phase 10 changed the default from a tagless shallow clone to a full one.
+ * `--no-tags` looked like a harmless speedup, but anything that derives its
+ * version from `git describe` (fzf's Makefile, among others) then fails with
+ * "Not on git repository" — a harness artifact reported as a docs failure.
+ * `README_TEST_SHALLOW=1` restores the cheap `--depth 1 --no-tags` clone for
+ * very large repos where history is not worth the wait.
+ *
+ * Local paths work too, which is what the tests use.
  */
 export async function cloneRepo(
   repoUrl: string,
@@ -59,13 +78,52 @@ export async function cloneRepo(
   created.push(workdir);
   const cloneDir = join(workdir, CLONE_DIR_NAME);
 
-  console.log(`[repo] cloning ${repoUrl} -> ${workdir}`);
+  infoLine(`[repo] cloning ${repoUrl} -> ${workdir}`);
+
+  // file:// is transport only. Git for Windows resolves it differently from an
+  // interactive shell, so translate it to a native path and try a filesystem
+  // copy first: that is what the tests use, and it is what the container mount
+  // needs.
+  let localPath = repoUrl;
+  if (repoUrl.startsWith("file://")) {
+    try {
+      localPath = fileURLToPath(repoUrl);
+    } catch {
+      localPath = repoUrl.slice("file://".length);
+    }
+  }
+
   try {
-    await run(
-      "git",
-      ["clone", "--depth", "1", "--single-branch", "--no-tags", "--quiet", repoUrl, cloneDir],
-      { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
-    );
+    if ((await exists(localPath)) && (await isGitRepo(localPath))) {
+      // Direct copy is the reliable path for local repos on Windows; it avoids
+      // git's path-translation differences between a shell and execFile.
+      await cp(localPath, cloneDir, { recursive: true, force: true });
+      infoLine(`[repo] copied local repo ${localPath} -> ${cloneDir}`);
+      return { workdir, cloneDir };
+    }
+
+    // Not a local git repo (or not local at all): fall back to git clone.
+    const shallow = process.env.README_TEST_SHALLOW === "1";
+    const args = [
+      // Git for Windows defaults to core.autocrlf=true, so a clone on the host
+      // checks shell scripts out with CRLF. The Linux container then runs
+      // `bash scripts/prepare.sh` and dies on `$'\r': command not found` — a
+      // checkout artifact, not a docs bug (Nest's CONTRIBUTING.md hit this in
+      // Phase 10). Pin the checkout to LF for both the clone and the new repo.
+      "-c",
+      "core.autocrlf=false",
+      "clone",
+      ...(shallow ? ["--depth", "1", "--no-tags"] : []),
+      "--config",
+      "core.autocrlf=false",
+      "--config",
+      "core.eol=lf",
+      "--single-branch",
+      "--quiet",
+      repoUrl,
+      cloneDir,
+    ];
+    await run("git", args, { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
   } catch (err) {
     await removeWorkdir(workdir);
     const killed = Boolean((err as { killed?: boolean }).killed);
@@ -78,6 +136,18 @@ export async function cloneRepo(
   return { workdir, cloneDir };
 }
 
+/** Is `p` a git repository (has a .git directory or is the .git itself)? */
+async function isGitRepo(p: string): Promise<boolean> {
+  // .git can be a file (submodule) or a directory; both count.
+  try {
+    const s = await stat(join(p, ".git"));
+    s; // suppress unused — we only care that stat succeeded
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 /** Remove one workdir. Missing is fine; failures are only logged. */
 export async function removeWorkdir(dir: string): Promise<void> {
   const index = created.indexOf(dir);
@@ -85,7 +155,7 @@ export async function removeWorkdir(dir: string): Promise<void> {
   try {
     await rm(dir, { recursive: true, force: true, maxRetries: 3 });
   } catch (err) {
-    console.warn(`[repo] could not remove ${dir}: ${message(err)}`);
+    warnLine(`[repo] could not remove ${dir}: ${message(err)}`);
   }
 }
 

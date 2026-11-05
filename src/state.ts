@@ -53,8 +53,29 @@ export const StepSchema = z.object({
     ),
   source: z.string().describe("Repo-relative path of the doc the block came from."),
   heading: z.string().optional().describe("Nearest heading above the block, as context."),
+  /**
+   * Why a `runnable: false` step is not run, when a specific reason is known.
+   *
+   * The extractor only sets this for the self-clone case; everything else uses
+   * the generic "not runnable unattended" wording.
+   */
+  skipReason: z.string().optional(),
 });
 export type Step = z.infer<typeof StepSchema>;
+
+/**
+ * A command a doc tells a reader to run, kept for the CI cross-check (Phase 7).
+ *
+ * Deliberately *not* mode-filtered: CI is contributor-facing, so comparing it
+ * only against `--mode user` steps would report every test and lint command as
+ * undocumented.
+ */
+export const DocumentedCommandSchema = z.object({
+  command: z.string(),
+  source: z.string(),
+  heading: z.string().optional(),
+});
+export type DocumentedCommand = z.infer<typeof DocumentedCommandSchema>;
 
 /** The record of one step execution in the container. */
 export const StepResultSchema = z.object({
@@ -66,6 +87,13 @@ export const StepResultSchema = z.object({
   stderr: z.string(),
   durationMs: z.number(),
   reason: z.string().optional().describe("LLM diagnosis reason, or a skip explanation."),
+  /**
+   * A command the model proposed (Phase 6) that did not earn a `workaround`.
+   *
+   * Kept apart from `command` so the report can show what the docs say to run
+   * *and* what was tried instead, without pretending one is the other.
+   */
+  attemptedFix: z.string().optional(),
 });
 export type StepResult = z.infer<typeof StepResultSchema>;
 
@@ -77,6 +105,22 @@ export const CiFindingSchema = z.object({
   note: z.string(),
 });
 export type CiFinding = z.infer<typeof CiFindingSchema>;
+
+/**
+ * Prefix of the reason a step gets when the Phase 9 command budget ran out.
+ *
+ * Shared by the graph (which writes it) and the report (which counts it), so the
+ * summary can tell a budget stop apart from an interactive command instead of
+ * calling both "not runnable".
+ */
+export const BUDGET_SKIP_REASON = "command budget reached";
+
+/**
+ * Reason a step gets when the docs tell a reader to clone the repository under
+ * test — which the run has already done.
+ */
+export const SELF_CLONE_SKIP_REASON =
+  "already checked out — the run is testing a clone of this repo";
 
 /** Append-only reducer shared by every list channel. */
 const append = <T>(current: T[], update: T[]): T[] => current.concat(update);
@@ -100,11 +144,24 @@ export const RunState = z.object({
   /** Running container id, once setup has started one. */
   containerId: z.string().optional(),
 
+  /**
+   * Directory the next step should run in, relative to the container mount.
+   *
+   * Docker exec starts every command in the same workdir, so a documented
+   * `cd my-app` would otherwise be lost before the next step. Phase 10 hit this
+   * with Fastify's quick start: the docs create and enter `my-app`, then install
+   * and run there. The graph carries the last successful `cd` forward.
+   */
+  cwd: z.string().register(registry, { default: () => "/workspace" }),
+
   /** Docs discovered by discover_docs. */
   docs: z.array(DocPageSchema).register(registry, { default: () => [] }),
 
   /** Ordered commands to run. */
   steps: z.array(StepSchema).register(registry, { default: () => [] }),
+
+  /** Every command the docs contain, before the mode filter (Phase 7). */
+  docCommands: z.array(DocumentedCommandSchema).register(registry, { default: () => [] }),
 
   /** Index of the step run_step is currently on. */
   idx: z.number().int().nonnegative().register(registry, { default: () => 0 }),
@@ -126,6 +183,14 @@ export const RunState = z.object({
     reducer: { schema: z.array(CiFindingSchema), fn: append<CiFinding> },
     default: () => [],
   }),
+
+  /**
+   * Prose summary of `ciFindings`, written by the fast model (Phase 7).
+   *
+   * Empty when nothing differed or the model was unavailable — the findings are
+   * deterministic either way, so the report only loses the sentence.
+   */
+  ciSummary: z.string().register(registry, { default: () => "" }),
 
   /**
    * Final markdown report (Phase 8).
